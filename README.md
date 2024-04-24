@@ -1,4 +1,5 @@
 # V1: Naive Implementation
+最简单的实现方法是一个线程负责计算一个C的值
 ```c++
 __global__ void sgemm_v1(int m, int n, int k, const float alpha, const float* A, int lda, const float* B, int ldb, const float beta, float* C, int ldc)
 {

@@ -21,6 +21,8 @@
         }                                                   \
     } while (0)
 
+#define BLOCK_SIZE 32
+
 #define CEIL_DIV(a, b) ((a + b - 1) / b)
 typedef struct {
     int height;
@@ -192,15 +194,15 @@ double testGemm(cublasGemmFunc gemm, int M, int N, int K, bool log = true)
 
 __global__ void sgemm_v1(int m, int n, int k, const float alpha, const float* A, int lda, const float* B, int ldb, const float beta, float* C, int ldc)
 {
-    int threadRow = blockIdx.x * blockDim.x + threadIdx.x;
-    int threadCol = blockIdx.y * blockDim.y + threadIdx.y;
+    int t_row = blockIdx.x * blockDim.x + threadIdx.x;
+    int t_col = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (threadRow < m && threadCol < n) {
-        float s = 0.0f;
+    if (t_row < m && t_col < n) {
+        float sum = 0.0f;
         for (int i = 0; i < k; ++i) {
-            s += A[threadRow * lda + i] * B[i * ldb + threadCol];
+            sum = sum + A[t_row * lda + i] * B[i * ldb + t_col];
         }
-        C[threadRow * ldc + threadCol] = alpha * s + beta * C[threadRow * ldc + threadCol];
+        C[t_row * ldc + t_col] = alpha * sum + beta * C[t_row * ldc + t_col];
     }
 }
 
@@ -217,7 +219,7 @@ void mySgemm_v1(cublasHandle_t handle, cublasOperation_t transa, cublasOperation
     float* C,
     int ldc)
 {
-    dim3 blocks(32, 32);
+    dim3 blocks(BLOCK_SIZE, BLOCK_SIZE);
     dim3 grids(CEIL_DIV(m, blocks.x), CEIL_DIV(n, blocks.y));
 
     sgemm_v1<<<grids, blocks>>>(m, n, k, *alpha, A, lda, B, ldb, *beta, C, ldc);
@@ -225,11 +227,102 @@ void mySgemm_v1(cublasHandle_t handle, cublasOperation_t transa, cublasOperation
     cudaDeviceSynchronize();
 }
 
+__global__ void sgemm_v2(int m, int n, int k, const float alpha, const float* A, int lda, const float* B, int ldb, const float beta, float* C, int ldc)
+{
+    const uint tx = threadIdx.x + blockDim.x * blockIdx.x;
+    const uint ty = threadIdx.y + blockDim.y * blockIdx.y;
+
+    if (ty < m && tx < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum = sum + A[ty * lda + i] * B[i * ldb + tx];
+        }
+        C[ty * ldc + tx] = alpha * sum + beta * C[ty * ldc + tx];
+    }
+}
+
+void mySgemm_v2(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+    int m,
+    int n,
+    int k,
+    const float* alpha,
+    const float* A,
+    int lda,
+    const float* B,
+    int ldb,
+    const float* beta,
+    float* C,
+    int ldc)
+{
+    dim3 blocks(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grids(CEIL_DIV(n, blocks.x), CEIL_DIV(m, blocks.y));
+
+    sgemm_v2<<<grids, blocks>>>(m, n, k, *alpha, A, lda, B, ldb, *beta, C, ldc);
+
+    cudaDeviceSynchronize();
+}
+
+__global__ void sgemm_v3(int m, int n, int k, const float alpha, const float* A, int lda, const float* B, int ldb, const float beta, float* C, int ldc)
+{
+    __shared__ float As[BLOCK_SIZE * BLOCK_SIZE];
+    __shared__ float Bs[BLOCK_SIZE * BLOCK_SIZE];
+
+    const uint bx = blockIdx.x * blockDim.x;
+    const uint by = blockIdx.y * blockDim.y;
+
+    const uint tx = threadIdx.x;
+    const uint ty = threadIdx.y;
+
+    A += by * lda;
+    B += bx;
+    C += by * ldc + bx;
+
+    float tmp = 0.0;
+    for (int bk = 0; bk < k; bk += BLOCK_SIZE) {
+        As[ty * BLOCK_SIZE + tx] = A[lda * ty + tx];
+        Bs[ty * BLOCK_SIZE + tx] = B[ldb * ty + tx];
+
+        __syncthreads();
+
+        for (int ki = 0; ki < BLOCK_SIZE; ++ki) {
+            tmp += As[ty * BLOCK_SIZE + ki] * Bs[ki * BLOCK_SIZE + tx];
+        }
+
+        __syncthreads();
+
+        A += BLOCK_SIZE;
+        B += BLOCK_SIZE * ldb;
+    }
+
+    C[ldc * ty + tx] = alpha * tmp + beta * C[ldc * ty + tx];
+}
+
+void mySgemm_v3(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+    int m,
+    int n,
+    int k,
+    const float* alpha,
+    const float* A,
+    int lda,
+    const float* B,
+    int ldb,
+    const float* beta,
+    float* C,
+    int ldc)
+{
+    dim3 blocks(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grids(CEIL_DIV(n, blocks.x), CEIL_DIV(m, blocks.y));
+
+    sgemm_v3<<<grids, blocks>>>(m, n, k, *alpha, A, lda, B, ldb, *beta, C, ldc);
+
+    cudaDeviceSynchronize();
+}
+
 double test(cublasGemmFunc gemm, std::string name)
 {
-    int len = 4;
+    int len = 3;
     int arr[] = { 512, 1024, 2048, 4096, 8192 };
-    // checkOk(gemm, name);
+    checkOk(gemm, name);
 
     double sum_gflpos = 0;
     for (int i = 0; i < len; ++i) {
@@ -245,10 +338,19 @@ double test(cublasGemmFunc gemm, std::string name)
     return sum_gflpos;
 }
 
+#include <thread>
+
 int main()
 {
     auto cublas_gflopos = test(cublasSgemm_void, "cublasSgemm_void");
+
     auto v1_gflopos = test(mySgemm_v1, "mySgemm_v1");
-    printf("Achieve: %12.3f\n", v1_gflopos / cublas_gflopos);
+    printf("V1 Achieve: %12.3f\n", v1_gflopos / cublas_gflopos);
+
+    auto v2_gflopos = test(mySgemm_v2, "mySgemm_v2");
+    printf("V2 Achieve: %12.3f\n", v2_gflopos / cublas_gflopos);
+
+    auto v3_gflopos = test(mySgemm_v3, "mySgemm_v3");
+    printf("V3 Achieve: %12.3f\n", v3_gflopos / cublas_gflopos);
     return 0;
 }
